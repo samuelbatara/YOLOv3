@@ -5,219 +5,164 @@ import torch.nn as nn
 Tuple: (filters, kernel_size, stride)
 Jika filters = -1, maka filters = 3 * (num_classes + 5)
 """
-config = [ # input: 416 x 416
-    (32, 3, 1), # output: 416 x 416
-    (64, 3, 2), # output: 208 x 208
-    [
-        "Residual",
-        [(32, 1, 1), (64, 3, 1)],
-        1
-    ], # output: 208 x 208
-    (128, 3, 2), # output: 104 x 104
-    [
-        "Residual",
-        [(64, 1, 1), (128, 3, 1)],
-        2
-    ], # output: 104 x 104
-    (256, 3, 2), # output: 52 x 52
-    [
-        "Residual",
-        [(128, 1, 1), (256, 3, 1)],
-        8
-    ], # output: 52 x 52
-    (512, 3, 2), # output: 26 x 26
-    [
-        "Residual",
-        [(256, 1, 1), (512, 3, 1)],
-        8
-    ], # output: 26 x 26
-    (1024, 3, 2), # output: 13 x 13
-    [
-        "Residual",
-        [(512, 1, 1), (1024, 3, 1)],
-        4
-    ], # output: 13 x 13
-    (512, 1, 1), # output: 13 x 13
-    (1024, 3, 1), # output: 13 x 13
-    (512, 1, 1), # output: 13 x 13
-    (1024, 3, 1), # output: 13 x 13
-    (512, 1, 1), # output: 13 x 13
-    [
-        "Output",
-        [(1024, 3, 1),(-1, 1, 1)] 
-    ],
-    (256, 1, 1), # output: 13 x 13
-    "Upsample", # output: 26 x 26
-    (256, 1, 1), # output: 26 x 26
-    (512, 3, 1), # output: 26 x 26
-    (256, 1, 1), # output: 26 x 26
-    (512, 3, 1), # output: 26 x 26
-    (256, 1, 1), # output: 26 x 26
-    [
-        "Output",
-        [(512, 3, 1), (-1, 1, 1)]
-    ],
-    (128, 1, 1), # output: 26 x 26
-    "Upsample", # output: 52 x 52
-    (128, 1, 1), # output: 52 x 52
-    (256, 3, 1), # output: 52 x 52
-    (128, 1, 1), # output: 52 x 52
-    (256, 3, 1), # output: 52 x 52
-    (128, 1, 1), # output: 52 x 52
-    [
-        "Output",
-        [(256, 3, 1), (-1, 1, 1)]
-    ]
+config = [
+    (32, 3, 1),
+    (64, 3, 2),
+    ["B", 1],
+    (128, 3, 2),
+    ["B", 2],
+    (256, 3, 2),
+    ["B", 8],
+    (512, 3, 2),
+    ["B", 8],
+    (1024, 3, 2),
+    ["B", 4],  # To this point is Darknet-53
+    (512, 1, 1),
+    (1024, 3, 1),
+    "S",
+    (256, 1, 1),
+    "U",
+    (256, 1, 1),
+    (512, 3, 1),
+    "S",
+    (128, 1, 1),
+    "U",
+    (128, 1, 1),
+    (256, 3, 1),
+    "S",
 ]
 
+
 class CNNBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, **kwargs):
+    def __init__(self, in_channels, out_channels, bn_act=True, **kwargs):
         super().__init__()
-        self.conv = nn.Conv2d(
-            in_channels=in_channels, 
-            out_channels=out_channels,
-            bias=False,
-            **kwargs,
-        )
-        self.batchnorm = nn.BatchNorm2d(out_channels)
+        self.conv = nn.Conv2d(in_channels, out_channels, bias=not bn_act, **kwargs)
+        self.bn = nn.BatchNorm2d(out_channels)
         self.leaky = nn.LeakyReLU(0.1)
+        self.use_bn_act = bn_act
 
     def forward(self, x):
-        return self.leaky(self.batchnorm(self.conv(x)))
+        if self.use_bn_act:
+            return self.leaky(self.bn(self.conv(x)))
+        else:
+            return self.conv(x)
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, channels, use_residual=True, num_repeats=1):
+        super().__init__()
+        self.layers = nn.ModuleList()
+        for repeat in range(num_repeats):
+            self.layers += [
+                nn.Sequential(
+                    CNNBlock(channels, channels // 2, kernel_size=1),
+                    CNNBlock(channels // 2, channels, kernel_size=3, padding=1),
+                )
+            ]
+
+        self.use_residual = use_residual
+        self.num_repeats = num_repeats
+
+    def forward(self, x):
+        for layer in self.layers:
+            if self.use_residual:
+                x = x + layer(x)
+            else:
+                x = layer(x)
+
+        return x
+
+
+class ScalePrediction(nn.Module):
+    def __init__(self, in_channels, num_classes):
+        super().__init__()
+        self.pred = nn.Sequential(
+            CNNBlock(in_channels, 2 * in_channels, kernel_size=3, padding=1),
+            CNNBlock(
+                2 * in_channels, (num_classes + 5) * 3, bn_act=False, kernel_size=1
+            ),
+        )
+        self.num_classes = num_classes
+
+    def forward(self, x):
+        return (
+            self.pred(x)
+            .reshape(x.shape[0], 3, self.num_classes + 5, x.shape[2], x.shape[3])
+            .permute(0, 1, 3, 4, 2)
+        )
+
 
 class YOLOv3(nn.Module):
-    def __init__(self, in_channels=3, num_classes=20, **kwargs):
+    def __init__(self, in_channels=3, num_classes=80):
         super().__init__()
-        self.in_channels = in_channels
         self.num_classes = num_classes
-        self._layers = self._create_layers()
+        self.in_channels = in_channels
+        self.layers = self._create_conv_layers()
 
     def forward(self, x):
-        layers = self._layers
-        outputs = []
-        save_outputs = []
+        outputs = []  # for each scale
+        route_connections = []
+        for layer in self.layers:
+            if isinstance(layer, ScalePrediction):
+                outputs.append(layer(x))
+                continue
 
-        print("Input:", x.shape)
-        for layer in layers:
-            tmp_x = x
-            if(isinstance(layer, CNNBlock)):
-                print("After Conv:", end="\t")
-                x = layer(x)
+            x = layer(x)
 
-            elif(isinstance(layer, list) and layer[0] == "Residual"):
-                print("After Residual:", end="\t")
-                for _ in range(layer[2]):
-                    xx = x 
-                    for conv in layer[1]:
-                        x = conv(x)
-                    x += xx 
-                if(int(layer[2]) == 8):
-                    save_outputs.append(x)
-            
-            elif(isinstance(layer, list) and layer[0] == "Output"):
-                print("Output: ", end="\t")
-                res = x
-                for conv in layer[1]:
-                    res = conv(res)
+            if isinstance(layer, ResidualBlock) and layer.num_repeats == 8:
+                route_connections.append(x)
 
-                res = res.reshape(
-                    res.shape[0], 3, self.num_classes + 5, res.shape[2], res.shape[3] 
-                ).permute(0, 1, 3, 4, 2)
-
-                outputs.append(res)
-            
-            elif(isinstance(layer, nn.Upsample)):
-                print("After upsample:", end="\t")
-                x = layer(x)
-                x = torch.cat((x, save_outputs.pop()), dim=1)
-
-            print(x.shape)
+            elif isinstance(layer, nn.Upsample):
+                x = torch.cat([x, route_connections[-1]], dim=1)
+                route_connections.pop()
 
         return outputs
 
-    def _create_layers(self) -> list:
-        layers = []
+    def _create_conv_layers(self):
+        layers = nn.ModuleList()
         in_channels = self.in_channels
 
         for module in config:
-            if(isinstance(module, tuple)):
+            if isinstance(module, tuple):
+                out_channels, kernel_size, stride = module
                 layers.append(
                     CNNBlock(
-                        in_channels=in_channels,
-                        out_channels=module[0],
-                        kernel_size=module[1],
-                        stride=module[2],
-                        padding=module[1]//2,
+                        in_channels,
+                        out_channels,
+                        kernel_size=kernel_size,
+                        stride=stride,
+                        padding=1 if kernel_size == 3 else 0,
                     )
                 )
-                in_channels = module[0]
+                in_channels = out_channels
 
-            elif(isinstance(module, list) and module[0] == "Residual"):
-                residuals = []
-                for _ in range(module[2]):
-                    conv1 = module[1][0]
-                    conv2 = module[1][1] 
-                    residuals.append(
-                        CNNBlock(
-                            in_channels=in_channels,
-                            out_channels=conv1[0],
-                            kernel_size=conv1[1],
-                            stride=conv1[2],
-                            padding=conv1[1]//2,
-                        )
-                    )
-                    residuals.append(
-                        CNNBlock(
-                            in_channels=conv1[0],
-                            out_channels=conv2[0],
-                            kernel_size=conv2[1],
-                            stride=conv2[2],
-                            padding=conv2[1]//2,
-                        )
-                    )
-                    in_channels = conv2[0]
-                    
-                layers.append(["Residual", residuals, module[2]])
+            elif isinstance(module, list):
+                num_repeats = module[1]
+                layers.append(ResidualBlock(in_channels, num_repeats=num_repeats,))
 
-            elif(isinstance(module, list) and module[0] == "Output"):
-                outputs = []
-                conv1 = module[1][0]
-                conv2 = module[1][1]
-                outputs.append(
-                    CNNBlock(
-                        in_channels=in_channels,
-                        out_channels=conv1[0],
-                        kernel_size=conv1[1],
-                        stride=conv1[2],
-                        padding=conv1[1]//2,
-                    )
-                )
-                outputs.append(
-                    CNNBlock(
-                        in_channels=conv1[0],
-                        out_channels=3 * (self.num_classes + 5),
-                        kernel_size=conv2[1],
-                        stride=conv2[2],
-                        padding=conv2[1]//2,
-                    )
-                )
+            elif isinstance(module, str):
+                if module == "S":
+                    layers += [
+                        ResidualBlock(in_channels, use_residual=False, num_repeats=1),
+                        CNNBlock(in_channels, in_channels // 2, kernel_size=1),
+                        ScalePrediction(in_channels // 2, num_classes=self.num_classes),
+                    ]
+                    in_channels = in_channels // 2
 
-                layers.append(["Output", outputs])
-
-            elif(isinstance(module, str)):
-                layers.append(
-                    nn.Upsample(scale_factor=2),
-                )
-                in_channels *= 3
+                elif module == "U":
+                    layers.append(nn.Upsample(scale_factor=2),)
+                    in_channels = in_channels * 3
 
         return layers
 
-if __name__ == "__main__": 
-    X = torch.rand(5, 3, 416, 416)
-    model = YOLOv3(in_channels=3, num_classes=20)
 
-    outputs = model(X)
-    assert outputs[0].shape == (5, 3, 13, 13, 25)
-    assert outputs[1].shape == (5, 3, 26, 26, 25)
-    assert outputs[2].shape == (5, 3, 52, 52, 25)
+if __name__ == "__main__":
+    num_classes = 20
+    IMAGE_SIZE = 416
+    model = YOLOv3(num_classes=num_classes)
+    x = torch.randn((2, 3, IMAGE_SIZE, IMAGE_SIZE))
+    out = model(x)
+    assert model(x)[0].shape == (2, 3, IMAGE_SIZE//32, IMAGE_SIZE//32, num_classes + 5)
+    assert model(x)[1].shape == (2, 3, IMAGE_SIZE//16, IMAGE_SIZE//16, num_classes + 5)
+    assert model(x)[2].shape == (2, 3, IMAGE_SIZE//8, IMAGE_SIZE//8, num_classes + 5)
     print("Berhasil!")
