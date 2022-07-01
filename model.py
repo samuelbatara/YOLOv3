@@ -1,10 +1,6 @@
 import torch
 import torch.nn as nn
 
-"""
-Tuple: (filters, kernel_size, stride)
-Jika filters = -1, maka filters = 3 * (num_classes + 5)
-"""
 config = [
     (32, 3, 1),
     (64, 3, 2),
