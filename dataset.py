@@ -1,15 +1,13 @@
-import numpy as np
+import torch 
+import torch.nn as nn
+import cv2
 import os
+from PIL import Image
 import pandas as pd
-import torch
 
-from PIL import Image, ImageFile
-from torch.utils.data import Dataset, DataLoader
-from utils import iou_width_height as iou
+from utils import iou_width_height
 
-ImageFile.LOAD_TRUNCATED_IMAGES = True
-
-class YOLODataset(Dataset):
+class YoloDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         csv_file,
@@ -21,60 +19,76 @@ class YOLODataset(Dataset):
         C=20,
         transform=None,
     ):
-        self.annotations = pd.read_csv(csv_file)
+        self.csv_file = pd.read_csv(csv_file)
         self.img_dir = img_dir
-        self.label_dir = label_dir
-        self.image_size = image_size
-        self.transform = transform
+        self.label_dir = label_dir 
+        self.anchors = torch.tensor(anchors[0] + anchors[1] + anchors[2])
+        self.num_anchors_per_scale = self.anchors.shape[0] // len(S)
         self.S = S
-        self.anchors = torch.tensor(anchors[0] + anchors[1] + anchors[2])  # for all 3 scales
-        self.num_anchors = self.anchors.shape[0]
-        self.num_anchors_per_scale = self.num_anchors // 3
         self.C = C
-        self.ignore_iou_thresh = 0.5
-
+        self.B = 3
+        self.transform = transform
+        self.ignore_iou_threshold = 0.5
+    
     def __len__(self):
-        return len(self.annotations)
+        return len(self.csv_file)
 
     def __getitem__(self, index):
-        label_path = os.path.join(self.label_dir, self.annotations.iloc[index, 1])
-        bboxes = np.roll(np.loadtxt(fname=label_path, delimiter=" ", ndmin=2), 4, axis=1).tolist()
-        img_path = os.path.join(self.img_dir, self.annotations.iloc[index, 0])
-        image = np.array(Image.open(img_path).convert("RGB"))
+        # Memuat bounding box
+        label_path = os.path.join(self.label_dir, self.csv_file.iloc[index, 1])
+        bboxes = self.get_bboxes(label_path)
 
-        if self.transform:
-            augmentations = self.transform(image=image, bboxes=bboxes)
-            image = augmentations["image"]
-            bboxes = augmentations["bboxes"]
+        # Memuat gambar
+        img_path = os.path.join(self.img_dir, self.csv_file.iloc[index, 0])
+        img = cv2.imread(img_path)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(img)
 
-        # Below assumes 3 scale predictions (as paper) and same num of anchors per scale
-        targets = [torch.zeros((self.num_anchors // 3, S, S, 6)) for S in self.S]
+        if(self.transform):
+            img = self.transform(img)
+
+        # targets.shape = (jumlah S, jumlah anchor per S, jumlah bounding box, S, S, 6)
+        targets = [torch.zeros((self.num_anchors_per_scale, S, S, 6)) for S in self.S]
         for box in bboxes:
-            iou_anchors = iou(torch.tensor(box[2:4]), self.anchors)
-            anchor_indices = iou_anchors.argsort(descending=True, dim=0)
-            x, y, width, height, class_label = box
-            has_anchor = [False] * 3  # each scale should have one anchor
-            for anchor_idx in anchor_indices:
-                scale_idx = anchor_idx // self.num_anchors_per_scale
+            class_label, x, y, width, height = box
+            iou_anchors = iou_width_height(
+                torch.tensor([width, height]),
+                self.anchors,
+            )
+            anchor_indexes = iou_anchors.argsort(descending=True, dim=0)
+            has_anchor = [False, False, False] 
+
+            for anchor_idx in anchor_indexes:
+                scale_idx = anchor_idx // self.num_anchors_per_scale 
                 anchor_on_scale = anchor_idx % self.num_anchors_per_scale
                 S = self.S[scale_idx]
-                i, j = int(S * y), int(S * x)  # which cell
+                i, j = int(S * y), int(S * x)
+                
                 anchor_taken = targets[scale_idx][anchor_on_scale, i, j, 0]
-                if not anchor_taken and not has_anchor[scale_idx]:
+
+                if(not anchor_taken and not has_anchor[scale_idx]):
                     targets[scale_idx][anchor_on_scale, i, j, 0] = 1
-                    x_cell, y_cell = S * x - j, S * y - i  # both between [0,1]
-                    width_cell, height_cell = (
-                        width * S,
-                        height * S,
-                    )  # can be greater than 1 since it's relative to cell
-                    box_coordinates = torch.tensor(
-                        [x_cell, y_cell, width_cell, height_cell]
-                    )
-                    targets[scale_idx][anchor_on_scale, i, j, 1:5] = box_coordinates
+                    x_cell, y_cell = S*x - j, S*y - i
+                    width_cell = S * width
+                    height_cell = S * height
+                    box_coordinate = torch.tensor([x_cell, y_cell, width_cell, height_cell])
+                    
+                    targets[scale_idx][anchor_on_scale, i, j, 1:5] = box_coordinate
                     targets[scale_idx][anchor_on_scale, i, j, 5] = int(class_label)
                     has_anchor[scale_idx] = True
+                
+                elif(not anchor_taken and iou_anchors[anchor_idx] > self.ignore_iou_threshold):
+                    targets[scale_idx][anchor_on_scale, i, j, 0] = -1
+        
+        return img, targets
 
-                elif not anchor_taken and iou_anchors[anchor_idx] > self.ignore_iou_thresh:
-                    targets[scale_idx][anchor_on_scale, i, j, 0] = -1  # ignore prediction
-
-        return image, tuple(targets)
+    def get_bboxes(self, label_path):
+        bboxes = []
+        
+        with open(label_path, "r") as f:
+            for line in f.readlines():
+                 bboxes.append(
+                     list(map(float, line.split(' ')))
+                 )
+        
+        return bboxes
