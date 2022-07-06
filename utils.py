@@ -235,14 +235,17 @@ def get_evaluation_bboxes(
     device="cuda",
 ):
     """
-    {deskripsi}
+    Mendapatkan kotak prediksi yang telah dikurangi dengan non max suppression
+    dan kotak target.
+    Kotak prediksi dan target dapat digunakan untuk menghitung mean average precision
 
     Parameters:
         loader (torch.utils.data.DataLoader): data loader
         model (nn.Module): model YOLOv3
-        iou_threshold: 
-        anchors: 
-        treshold: 
+        iou_threshold (float): iou threshold pada non max suppression
+        anchors (list): anchors
+        threshold (float): threshold pada non max suppression
+        num_classes (int): jumlah kelas
         device: "cuda" atau "cpu"
 
     Returns:
@@ -254,24 +257,24 @@ def get_evaluation_bboxes(
     all_pred_boxes = []
     all_true_boxes = []
 
-    for x, y in enumerate(loader):
+    for batch_idx, (x, y) in enumerate(loader):
         x = x.to(device)
 
         with torch.no_grad():
             preds = model(x)
 
-        N = preds.shape[0] 
+        N = x.shape[0]
         bboxes = [[] for _ in range(N)]
 
         for i in range(3):
             S = preds[i].shape[2]
             anchor = torch.tensor([*anchors[i]]).to(device) * S
             boxes_scale_S = cells_to_bboxes(
-                preds[i], anchors, S, is_pred=True,
+                preds[i], anchor, S, is_pred=True,
             )
 
             for idx, box in enumerate(boxes_scale_S):
-                bboxes[idx].append(box)
+                bboxes[idx] += box
 
         # HANYA MENGGUNAKAN SCALE=52
         true_bboxes = cells_to_bboxes(
